@@ -22,6 +22,7 @@ import {
   WallCell,
 } from '../types/game';
 import { WALL_LAYOUT, getValidRowsForColor } from './gameEngine';
+import pretrainedCheckpoint from '../data/pretrainedWeights.json';
 
 // ─────────────────────────────────────────────
 // Types
@@ -70,7 +71,7 @@ const NUM_FEATURES = 80;
 // Pre-trained weights
 // ─────────────────────────────────────────────
 
-const PRETRAINED_WEIGHTS: number[] = [
+const SEED_WEIGHTS: number[] = [
   // [0] current score
    1.20,
   // [1] opponent best score
@@ -137,6 +138,17 @@ const PRETRAINED_WEIGHTS: number[] = [
   -50.00, // floor when could place (置けるのにフロア)
 ];
 
+/**
+ * Offline self-play checkpoint.  Keeping this in the bundle means a fresh
+ * browser starts from the trained policy instead of from hand-tuned weights.
+ * The runtime trainer can still refine it and stores those refinements in
+ * localStorage.
+ */
+const PRETRAINED_WEIGHTS: number[] = pretrainedCheckpoint.weights.length === NUM_FEATURES
+  ? [...pretrainedCheckpoint.weights]
+  : SEED_WEIGHTS;
+const PRETRAINED_TRAINING_COUNT = pretrainedCheckpoint.trainingCount;
+
 // ─────────────────────────────────────────────
 // RL Weight Manager
 // ─────────────────────────────────────────────
@@ -161,7 +173,7 @@ function loadWeights(): void {
     }
   } catch (_e) { /* ignore */ }
   currentWeights = [...PRETRAINED_WEIGHTS];
-  trainingCount = 0;
+  trainingCount = PRETRAINED_TRAINING_COUNT;
 }
 
 function saveWeights(): void {
@@ -173,7 +185,7 @@ function saveWeights(): void {
 
 export function resetWeights(): void {
   currentWeights = [...PRETRAINED_WEIGHTS];
-  trainingCount = 0;
+  trainingCount = PRETRAINED_TRAINING_COUNT;
   saveWeights();
 }
 
