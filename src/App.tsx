@@ -2,7 +2,13 @@ import { useState, useEffect, useRef } from 'react';
 import { GameState, TileColor, PlayerType } from './types/game';
 import type { AIDifficulty } from './types/game';
 import { initializeGame, draftTiles, getValidRowsForColor } from './utils/gameEngine';
-import { getAIMoveAdvanced, getTrainingInfo } from './utils/aiEngine';
+import {
+  clearHumanTrajectory,
+  getAIMoveAdvanced,
+  getTrainingInfo,
+  learnFromHumanGame,
+  recordHumanDecision,
+} from './utils/aiEngine';
 import { Setup } from './components/Setup';
 import { Board } from './components/Board';
 import { Plate } from './components/Plate';
@@ -21,6 +27,7 @@ export default function App() {
   const [selectedColor, setSelectedColor] = useState<TileColor | null>(null);
   
   const logEndRef = useRef<HTMLDivElement>(null);
+  const learnedCurrentGameRef = useRef(false);
 
   // Scroll to bottom of logs
   useEffect(() => {
@@ -44,6 +51,10 @@ export default function App() {
     }
     
     if (gameState.phase === 'game_over') {
+      if (!learnedCurrentGameRef.current) {
+        learnFromHumanGame(gameState);
+        learnedCurrentGameRef.current = true;
+      }
       // Fire confetti!
       canvasConfetti({
         particleCount: 150,
@@ -51,7 +62,7 @@ export default function App() {
         origin: { y: 0.6 }
       });
     }
-  }, [gameState?.currentPlayerIndex, gameState?.phase]);
+  }, [gameState?.currentPlayerIndex, gameState?.phase, gameState?.round]);
 
   const handleStartGame = (
     playerNames: string[],
@@ -61,6 +72,8 @@ export default function App() {
     variantSpecialFactories: boolean
   ) => {
     const newState = initializeGame(playerNames, playerTypes, aiDifficulties, variantGrayWall, variantSpecialFactories);
+    clearHumanTrajectory();
+    learnedCurrentGameRef.current = false;
     setGameState(newState);
     setSelectedSource(null);
     setSelectedColor(null);
@@ -94,6 +107,10 @@ export default function App() {
     playerIndex: number
   ) => {
     if (!gameState) return;
+
+    if (gameState.players[playerIndex].type === 'human') {
+      recordHumanDecision(gameState, playerIndex);
+    }
     
     const nextState = draftTiles(gameState, source, color, targetRowIndex, playerIndex);
     setGameState(nextState);
