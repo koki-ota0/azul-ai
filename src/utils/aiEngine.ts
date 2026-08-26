@@ -55,6 +55,10 @@ const SINGLE_TILE_PENALTY: number[] = [
   -30,  // Row 4: 1個だけは最悪（次に4個必要）
 ];
 
+// Completing a large pattern line converts many tiles into an immediate wall
+// placement and avoids locking a scarce colour into a long unfinished line.
+const LINE_COMPLETION_PRIORITY = [0, 10, 25, 70, 110];
+
 // ターン終了時の悪い状態ペナルティ
 // 2,3列目に中途半端に置いてある = 悪い
 // 4,5列目に3マス以上空きがある = 悪い
@@ -158,6 +162,7 @@ const TRAINING_COUNT_KEY = 'azul_rl_training_count_v5';
 
 let currentWeights: number[] = [...PRETRAINED_WEIGHTS];
 let trainingCount = 0;
+const humanTrajectory: { features: number[]; playerIndex: number }[] = [];
 
 function loadWeights(): void {
   try {
@@ -191,6 +196,45 @@ export function resetWeights(): void {
 
 export function getTrainingInfo(): { count: number; weights: number[] } {
   return { count: trainingCount, weights: [...currentWeights] };
+}
+
+/** Save the position immediately before a human makes a decision. */
+export function recordHumanDecision(state: GameState, playerIndex: number): void {
+  humanTrajectory.push({ features: extractFeatures(state, playerIndex), playerIndex });
+}
+
+/**
+ * Learn from a completed human game. Human wins receive a much stronger
+ * terminal signal so the value function preserves successful human strategy.
+ */
+export function learnFromHumanGame(finalState: GameState): void {
+  if (humanTrajectory.length === 0) return;
+
+  const totalSteps = humanTrajectory.length;
+  for (let t = 0; t < totalSteps; t++) {
+    const { features, playerIndex } = humanTrajectory[t];
+    const player = finalState.players[playerIndex];
+    const opponentBest = Math.max(
+      0,
+      ...finalState.players.filter((_, i) => i !== playerIndex).map(p => p.score),
+    );
+    const won = finalState.winnerIds.includes(player.id);
+    const terminalValue = (player.score - opponentBest * 0.6) / 10;
+    const target = terminalValue * Math.pow(GAMMA, totalSteps - t - 1);
+    const importance = won ? 6 : 0.5;
+    const error = target - evaluateWithWeights(features, currentWeights);
+    for (let i = 0; i < NUM_FEATURES; i++) {
+      currentWeights[i] += LR * importance * error * features[i];
+    }
+  }
+
+  humanTrajectory.length = 0;
+  trainingCount++;
+  saveWeights();
+}
+
+export function clearHumanTrajectory(): void {
+  humanTrajectory.length = 0;
 }
 
 export function exportWeights(): string {
@@ -250,12 +294,6 @@ function getRoundProgress(state: GameState): number {
 
 function isEarlyGame(state: GameState): boolean {
   return state.round <= 2 && getRoundProgress(state) < 0.5;
-}
-
-// Check if a color can be placed anywhere (not just floor)
-function canPlaceColorAnywhere(player: PlayerBoard, color: TileColor, variantGrayWall: boolean): boolean {
-  const validRows = getValidRowsForColor(player, color, variantGrayWall);
-  return validRows.some(v => v);
 }
 
 // Check which row already has this color in pattern line
@@ -677,17 +715,14 @@ function quickEvalMove(state: GameState, move: AIMove, pi: number): number {
   const early = isEarlyGame(state);
   
   // ═══════════════════════════════════════════
-  // CRITICAL: Never floor if can place somewhere!
+  // Floor is normally undesirable, but it remains a legal strategic choice.
+  // In particular, putting a single tile into a new fifth line locks that
+  // colour for several turns; a small floor penalty can be the better move.
   // ═══════════════════════════════════════════
-  const canPlace = canPlaceColorAnywhere(player, move.color, state.variantGrayWall);
-  
   if (move.targetRowIndex === 'floor') {
-    // If we CAN place this color somewhere, flooring is TERRIBLE
-    if (canPlace) {
-      return -500; // Absolutely forbidden
-    }
-    
-    // Otherwise, calculate floor penalty
+    // Calculate the actual penalty instead of ruling the move out. This lets
+    // the evaluator compare an intentional floor placement with a harmful
+    // singleton in a long pattern line.
     let fIdx = player.floor.length;
     if (move.source === 'center' && state.center.hasFirstPlayerTile) fIdx++;
     let pen = 0;
@@ -744,6 +779,7 @@ function quickEvalMove(state: GameState, move: AIMove, pi: number): number {
     if (early && rowIndex >= 3) {
       score -= 15; // Extra penalty in early game for big rows
     }
+    if (rowIndex === 4) score -= 45;
   }
 
   // ═══════════════════════════════════════════
@@ -787,6 +823,7 @@ function quickEvalMove(state: GameState, move: AIMove, pi: number): number {
   // Completion scoring
   // ═══════════════════════════════════════════
   if (willComplete) {
+    score += LINE_COMPLETION_PRIORITY[rowIndex];
     let colIndex = state.variantGrayWall
       ? findBestCol(player.wall, rowIndex, move.color)
       : WALL_LAYOUT[rowIndex].indexOf(move.color);
@@ -977,6 +1014,9 @@ function getHardMove(state: GameState): AIMove {
     } else {
       s = minimax(ns, depth - 1, -Infinity, Infinity, ns.currentPlayerIndex === pi, pi);
     }
+    // Preserve the immediate strategic preference for finishing long lines;
+    // a shallow search can otherwise undervalue the wall placement it creates.
+    s += m.score * 0.2;
     if (s > bestS) { bestS = s; best = m; }
   }
   return best;
