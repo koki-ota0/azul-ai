@@ -319,7 +319,7 @@ export default function App() {
             プレイヤーボード
           </div>
           
-          <div className="flex flex-col gap-6 overflow-y-auto max-h-[85vh] pr-2">
+          <div className="flex flex-col gap-6 overflow-y-auto max-h-[130vh] pr-2">
             {/* Show current player board first for easy visibility, then other players! */}
             {/* Or simply show in order but style the current player differently */}
             {gameState.players.map((board, idx) => {
