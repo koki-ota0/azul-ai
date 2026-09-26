@@ -21,7 +21,7 @@ import {
   TileColor,
   WallCell,
 } from '../types/game';
-import { WALL_LAYOUT, getValidRowsForColor } from './gameEngine';
+import { WALL_LAYOUT, getValidRowsForColor, fillPlatesAndStartRound } from './gameEngine';
 import pretrainedCheckpoint from '../data/pretrainedWeights.json';
 
 // ─────────────────────────────────────────────
@@ -69,7 +69,26 @@ const BAD_STATE_PENALTIES = {
   ROW_4_MOSTLY_EMPTY: -35, // 5列目に0-2個 (3マス以上空き)
 };
 
-const NUM_FEATURES = 80;
+const NUM_FEATURES = 117;
+
+// Training uses the rules evaluator for tactical signals, then adds the
+// learned long-term value of the resulting position.  Keeping the learned
+// contribution modest makes early training stable while still letting a
+// better value function change the policy.
+const TRAINING_VALUE_WEIGHT = 3;
+const CHECKPOINT_EVALUATION_GAMES = 24;
+const CHECKPOINT_ACCEPTANCE_RATE = 0.55;
+
+export interface CheckpointEvaluation {
+  games: number;
+  wins: number;
+  losses: number;
+  draws: number;
+  score: number;
+  accepted: boolean;
+}
+
+let lastCheckpointEvaluation: CheckpointEvaluation | null = null;
 
 // ─────────────────────────────────────────────
 // Pre-trained weights
@@ -140,7 +159,28 @@ const SEED_WEIGHTS: number[] = [
   -25.00, // row 3 mostly empty (4列目ほぼ空)
   -35.00, // row 4 mostly empty (5列目ほぼ空)
   -50.00, // floor when could place (置けるのにフロア)
+  // [80..116] strategic extensions: denial, centre columns, long-line
+  // commitments, tile availability, and final-round risk.
+   5.00, 5.00, 5.00, 5.00, 5.00, // opponent one-tile completions by colour
+  -8.00, -4.00, -10.00,           // opponent threats / vertical / game end
+   5.00, 8.00, 7.00, 6.00,         // central columns and aligned long lines
+   3.00, 3.00, -5.00, -7.00,       // productive vs unsafe 4th/5th lines
+   4.00, 4.00,                     // supply support / viable long lines
+   2.00, -8.00, 4.00,              // final round / first-player risk / partials
+   12.00, -12.00,                  // own vs opponent game-ending threat
+   3.00, 2.00,                     // catch-up urgency / protecting a lead
+   8.00, 3.00,                     // denial opportunity / opponent floor pressure
+   6.00, 5.00, 3.00, -6.00,        // centre adjacency / column readiness / supply / conflicts
+   5.00, 6.00,                     // immediate completion / endgame bonus potential
 ];
+
+function expandWeights(weights: number[]): number[] {
+  if (weights.length === NUM_FEATURES) return [...weights];
+  // v5 checkpoints had the original 80 features.  Preserve those learned
+  // values and initialise only the newly added strategic features.
+  if (weights.length === 80) return [...weights, ...SEED_WEIGHTS.slice(80)];
+  return [...SEED_WEIGHTS];
+}
 
 /**
  * Offline self-play checkpoint.  Keeping this in the bundle means a fresh
@@ -148,30 +188,31 @@ const SEED_WEIGHTS: number[] = [
  * The runtime trainer can still refine it and stores those refinements in
  * localStorage.
  */
-const PRETRAINED_WEIGHTS: number[] = pretrainedCheckpoint.weights.length === NUM_FEATURES
-  ? [...pretrainedCheckpoint.weights]
-  : SEED_WEIGHTS;
+const PRETRAINED_WEIGHTS: number[] = expandWeights(pretrainedCheckpoint.weights);
 const PRETRAINED_TRAINING_COUNT = pretrainedCheckpoint.trainingCount;
 
 // ─────────────────────────────────────────────
 // RL Weight Manager
 // ─────────────────────────────────────────────
 
-const STORAGE_KEY = 'azul_rl_weights_v5';
-const TRAINING_COUNT_KEY = 'azul_rl_training_count_v5';
+const STORAGE_KEY = 'azul_rl_weights_v6';
+const TRAINING_COUNT_KEY = 'azul_rl_training_count_v6';
+const LEGACY_STORAGE_KEY = 'azul_rl_weights_v5';
+const LEGACY_TRAINING_COUNT_KEY = 'azul_rl_training_count_v5';
 
 let currentWeights: number[] = [...PRETRAINED_WEIGHTS];
 let trainingCount = 0;
+let trainingCheckpointBaseline: number[] | null = null;
 const humanTrajectory: { features: number[]; playerIndex: number }[] = [];
 
 function loadWeights(): void {
   try {
-    const stored = localStorage.getItem(STORAGE_KEY);
-    const count = localStorage.getItem(TRAINING_COUNT_KEY);
+    const stored = localStorage.getItem(STORAGE_KEY) ?? localStorage.getItem(LEGACY_STORAGE_KEY);
+    const count = localStorage.getItem(TRAINING_COUNT_KEY) ?? localStorage.getItem(LEGACY_TRAINING_COUNT_KEY);
     if (stored) {
       const parsed = JSON.parse(stored) as number[];
-      if (parsed.length === NUM_FEATURES) {
-        currentWeights = parsed;
+      if (parsed.length === NUM_FEATURES || parsed.length === 80) {
+        currentWeights = expandWeights(parsed);
         trainingCount = count ? parseInt(count, 10) : 0;
         return;
       }
@@ -191,11 +232,23 @@ function saveWeights(): void {
 export function resetWeights(): void {
   currentWeights = [...PRETRAINED_WEIGHTS];
   trainingCount = PRETRAINED_TRAINING_COUNT;
+  trainingCheckpointBaseline = null;
+  lastCheckpointEvaluation = null;
   saveWeights();
 }
 
 export function getTrainingInfo(): { count: number; weights: number[] } {
   return { count: trainingCount, weights: [...currentWeights] };
+}
+
+export function getLastCheckpointEvaluation(): CheckpointEvaluation | null {
+  return lastCheckpointEvaluation ? { ...lastCheckpointEvaluation } : null;
+}
+
+/** Groups incremental browser batches into one candidate checkpoint. */
+export function beginTrainingCheckpoint(): void {
+  trainingCheckpointBaseline = [...currentWeights];
+  lastCheckpointEvaluation = null;
 }
 
 /** Save the position immediately before a human makes a decision. */
@@ -253,11 +306,13 @@ export function importWeights(json: string): { success: boolean; message: string
     if (!data.weights || !Array.isArray(data.weights)) {
       return { success: false, message: '無効なフォーマット' };
     }
-    if (data.weights.length !== NUM_FEATURES) {
-      return { success: false, message: `特徴量数不一致 (期待:${NUM_FEATURES}, 実際:${data.weights.length})` };
+    if (data.weights.length !== NUM_FEATURES && data.weights.length !== 80) {
+      return { success: false, message: `特徴量数不一致 (期待:${NUM_FEATURES} または旧80, 実際:${data.weights.length})` };
     }
-    currentWeights = data.weights;
+    currentWeights = expandWeights(data.weights);
     trainingCount = data.trainingCount || 0;
+    trainingCheckpointBaseline = null;
+    lastCheckpointEvaluation = null;
     saveWeights();
     return { success: true, message: `インポート成功! ${trainingCount.toLocaleString()}局` };
   } catch (e) {
@@ -478,6 +533,111 @@ function extractFeatures(state: GameState, playerIndex: number): number[] {
 
   f[79] = 0; // floor when could place - move specific
 
+  // Strategic extensions [80..116].  These are deliberately state based so
+  // they can be evaluated after every candidate move without leaking hidden
+  // bag information.
+  const visibleTiles = [...state.center.tiles, ...state.plates.flatMap((plate) => plate.tiles)];
+  const visibleByColor = ALL_COLORS.map((color) => visibleTiles.filter((tile) => tile === color).length);
+  let opponentImminent = 0;
+  let opponentVerticalThreat = 0;
+  let opponentGameEndThreat = 0;
+  let opponentFloorPressure = 0;
+  let opponentDenialOpportunity = 0;
+  for (let i = 0; i < state.players.length; i++) {
+    if (i === playerIndex) continue;
+    const opponent = state.players[i];
+    opponentFloorPressure += opponent.floor.length;
+    for (let r = 0; r < 5; r++) {
+      const count = opponent.patternLines[r].filter((tile) => tile !== null).length;
+      const color = opponent.patternLines[r].find((tile): tile is TileColor => tile !== null);
+      if (color && count === r) {
+        f[80 + ALL_COLORS.indexOf(color)] += 1;
+        opponentImminent++;
+      }
+      if (opponent.wall[r].filter((cell) => cell.placed).length >= 4) opponentGameEndThreat++;
+      if (count > 0 && count < r + 1 && color && visibleTiles.includes(color)) opponentDenialOpportunity++;
+    }
+    for (let c = 0; c < 5; c++) {
+      if (opponent.wall.filter((row) => row[c].placed).length >= 4) opponentVerticalThreat++;
+    }
+  }
+  for (let ci = 0; ci < 5; ci++) f[80 + ci] /= 5;
+  f[85] = opponentImminent / 5;
+  f[86] = opponentVerticalThreat / 5;
+  f[87] = opponentGameEndThreat / 5;
+
+  const centralColumns = [1, 2, 3];
+  let centralProgress = 0;
+  let centralNearComplete = 0;
+  let centralAdjacency = 0;
+  for (const c of centralColumns) {
+    const placed = player.wall.filter((row) => row[c].placed).length;
+    centralProgress += placed;
+    if (placed >= 4) centralNearComplete++;
+    for (let r = 0; r < 5; r++) {
+      if (player.wall[r][c].placed && ((r > 0 && player.wall[r - 1][c].placed) || (r < 4 && player.wall[r + 1][c].placed))) centralAdjacency++;
+    }
+  }
+  f[88] = centralProgress / 15;
+  f[89] = centralNearComplete / 3;
+  f[90] = centralAdjacency / 10;
+
+  let alignedLongLines = 0;
+  let productiveFourth = 0;
+  let productiveFifth = 0;
+  let unsafeFourth = 0;
+  let unsafeFifth = 0;
+  let suppliedCommitments = 0;
+  let viableLongLines = 0;
+  let immediateCompletions = 0;
+  let columnReady = 0;
+  for (let r = 0; r < 5; r++) {
+    const line = player.patternLines[r];
+    const count = line.filter((tile) => tile !== null).length;
+    const color = line.find((tile): tile is TileColor => tile !== null);
+    if (!color) continue;
+    const col = state.variantGrayWall ? findBestCol(player.wall, r, color) : WALL_LAYOUT[r].indexOf(color);
+    const available = visibleByColor[ALL_COLORS.indexOf(color)];
+    const missing = r + 1 - count;
+    if (r >= 3 && col !== -1 && player.wall.filter((wallRow) => wallRow[col].placed).length >= 2) alignedLongLines++;
+    if (r === 3 && count >= 2) productiveFourth++;
+    if (r === 4 && count >= 2) productiveFifth++;
+    if (r === 3 && count === 1 && (col === -1 || player.wall.filter((wallRow) => wallRow[col].placed).length < 2)) unsafeFourth++;
+    if (r === 4 && count <= 2 && (col === -1 || player.wall.filter((wallRow) => wallRow[col].placed).length < 2)) unsafeFifth++;
+    if (available >= missing) suppliedCommitments++;
+    if (r >= 3 && available > 0 && col !== -1) viableLongLines++;
+    if (count === r && available > 0) immediateCompletions++;
+    if (col !== -1 && player.wall.filter((wallRow) => wallRow[col].placed).length >= 3 && count >= r - 1) columnReady++;
+  }
+  f[91] = alignedLongLines / 2;
+  f[92] = productiveFourth;
+  f[93] = productiveFifth;
+  f[94] = unsafeFourth;
+  f[95] = unsafeFifth;
+  f[96] = suppliedCommitments / 5;
+  f[97] = viableLongLines / 2;
+
+  const finalRound = state.players.some((board) => board.wall.some((row) => row.filter((cell) => cell.placed).length >= 4));
+  f[98] = finalRound ? 1 : 0;
+  f[99] = finalRound && !state.isFirstPlayerClaimedThisRound ? 1 : 0;
+  f[100] = finalRound ? (productiveFourth + productiveFifth) / 2 : 0;
+  f[101] = player.wall.filter((row) => row.filter((cell) => cell.placed).length >= 4).length / 5;
+  f[102] = opponentGameEndThreat / 5;
+  f[103] = player.score < bestOppScore ? (bestOppScore - player.score) / 100 : 0;
+  f[104] = player.score > bestOppScore ? (player.score - bestOppScore) / 100 : 0;
+  f[105] = opponentDenialOpportunity / 5;
+  f[106] = opponentFloorPressure / 14;
+  f[107] = centralAdjacency / 10;
+  f[108] = columnReady / 5;
+  f[109] = suppliedCommitments / 5;
+  f[110] = opponentImminent / 5;
+  f[111] = scatterPenalty / 5;
+  f[112] = immediateCompletions / 5;
+  f[113] = alignedLongLines / 2;
+  f[114] = (centralNearComplete + columnReady) / 8;
+  f[115] = finalRound && player.floor.length > 0 ? player.floor.length / 7 : 0;
+  f[116] = finalRound && immediateCompletions > 0 ? 1 : 0;
+
   return f;
 }
 
@@ -593,6 +753,10 @@ function simulateDraft(state: GameState, move: AIMove, pi: number): GameState {
   if (empty && cEmpty) {
     s.phase = 'tiling';
     simTiling(s);
+    // simTiling scores the round; the real game then refills the factories.
+    // Without this, self-play stopped after one round and learned only an
+    // opening-position policy.
+    if ((s as GameState).phase === 'drafting') fillPlatesAndStartRound(s);
   } else {
     s.currentPlayerIndex = (s.currentPlayerIndex + 1) % s.players.length;
   }
@@ -741,6 +905,16 @@ function quickEvalMove(state: GameState, move: AIMove, pi: number): number {
   const toFloor = colorCount - toLine;
   const newCount = currentCount + toLine;
   const willComplete = newCount === capacity;
+  const targetColumn = state.variantGrayWall
+    ? findBestCol(player.wall, rowIndex, move.color)
+    : WALL_LAYOUT[rowIndex].indexOf(move.color);
+  const targetColumnProgress = targetColumn === -1
+    ? 0
+    : player.wall.filter((wallRow) => wallRow[targetColumn].placed).length;
+  const supportsVerticalPlan = rowIndex >= 3 && targetColumnProgress >= 2;
+  const finalRound = state.players.some((board) =>
+    board.wall.some((wallRow) => wallRow.filter((cell) => cell.placed).length >= 4),
+  );
 
   // ═══════════════════════════════════════════
   // CRITICAL: Color consistency - don't scatter!
@@ -774,7 +948,7 @@ function quickEvalMove(state: GameState, move: AIMove, pi: number): number {
   // ═══════════════════════════════════════════
   // Single tile placement penalty
   // ═══════════════════════════════════════════
-  if (currentCount === 0 && toLine === 1 && capacity >= 2) {
+  if (currentCount === 0 && toLine === 1 && capacity >= 2 && !supportsVerticalPlan && !finalRound) {
     score += SINGLE_TILE_PENALTY[rowIndex];
     if (early && rowIndex >= 3) {
       score -= 15; // Extra penalty in early game for big rows
@@ -810,12 +984,12 @@ function quickEvalMove(state: GameState, move: AIMove, pi: number): number {
   }
   
   // Row 3 (4列目): 0-1 tiles (3+ spaces) is bad
-  if (rowIndex === 3 && newCount <= 1) {
+  if (rowIndex === 3 && newCount <= 1 && !supportsVerticalPlan && !finalRound) {
     score += BAD_STATE_PENALTIES.ROW_3_MOSTLY_EMPTY;
   }
   
   // Row 4 (5列目): 0-2 tiles (3+ spaces) is bad
-  if (rowIndex === 4 && newCount <= 2) {
+  if (rowIndex === 4 && newCount <= 2 && !supportsVerticalPlan && !finalRound) {
     score += BAD_STATE_PENALTIES.ROW_4_MOSTLY_EMPTY;
   }
 
@@ -903,7 +1077,10 @@ function quickEvalMove(state: GameState, move: AIMove, pi: number): number {
     score += FLOOR_PENALTIES[Math.min(fIdx, 6)];
     const rp = getRoundProgress(state);
     const eg = isEndgame(state);
-    if (eg) score += 8;
+    // Taking the start marker in a possible final round often forces an
+    // unnecessary floor penalty after the game can already be ended.
+    if (finalRound) score -= 10;
+    else if (eg) score += 8;
     else if (rp < 0.3) score += 6;
     else score += 3.5;
   }
@@ -919,7 +1096,18 @@ function quickEvalMove(state: GameState, move: AIMove, pi: number): number {
       const cnt = line.filter((t) => t !== null).length;
       const cap = r + 1;
       if (cnt > 0 && cnt === cap - 1 && line.some((t) => t === move.color)) {
-        score += 5;
+        // Denial may be worth accepting a small immediate loss: completing
+        // this line can score and can also finish a row/column for the rival.
+        let threat = 10 + rowIndex * 3;
+        const opponentColumn = state.variantGrayWall
+          ? findBestCol(opp.wall, r, move.color)
+          : WALL_LAYOUT[r].indexOf(move.color);
+        if (opponentColumn !== -1) {
+          const vertical = opp.wall.filter((wallRow) => wallRow[opponentColumn].placed).length;
+          threat += vertical * 4;
+        }
+        if (opp.wall[r].filter((cell) => cell.placed).length >= 4) threat += 20;
+        score += threat;
       }
     }
   }
@@ -1077,6 +1265,82 @@ function minimax(s: GameState, d: number, a: number, b: number, max: boolean, ro
 const LR = 0.002;
 const GAMMA = 0.97;
 
+function trainingMove(
+  state: GameState,
+  playerIndex: number,
+  weights: number[],
+  explorationRate = 0,
+): AIMove {
+  const moves = generateAllMoves(state, playerIndex);
+  if (moves.length === 0) return fallback(state);
+
+  const scored = moves.map((move) => {
+    const immediate = quickEvalMove(state, move, playerIndex);
+    const next = simulateDraft(state, move, playerIndex);
+    const longTerm = next.phase === 'game_over'
+      ? terminal(next, playerIndex)
+      : evaluateRelativeWithWeights(next, playerIndex, weights);
+    return { ...move, score: immediate + TRAINING_VALUE_WEIGHT * longTerm };
+  });
+  scored.sort((a, b) => b.score - a.score);
+
+  if (explorationRate > 0 && Math.random() < explorationRate) {
+    const nonFloor = scored.filter((move) => move.targetRowIndex !== 'floor');
+    const pool = nonFloor.length > 0 ? nonFloor : scored;
+    return pool[Math.floor(Math.random() * pool.length)];
+  }
+  return scored[0];
+}
+
+function evaluateRelativeWithWeights(state: GameState, playerIndex: number, weights: number[]): number {
+  const mine = evaluateWithWeights(extractFeatures(state, playerIndex), weights);
+  let bestOpponent = -Infinity;
+  for (let i = 0; i < state.players.length; i++) {
+    if (i !== playerIndex) bestOpponent = Math.max(
+      bestOpponent,
+      evaluateWithWeights(extractFeatures(state, i), weights),
+    );
+  }
+  return mine - bestOpponent * 0.6;
+}
+
+function playEvaluationGame(
+  candidateWeights: number[],
+  baselineWeights: number[],
+  candidatePlayerIndex: number,
+  initGame: (...args: any[]) => GameState,
+): number {
+  let state = initGame(['Candidate', 'Baseline'], ['ai', 'ai'], ['hard', 'hard'], false, false);
+  let iterations = 1000;
+  while (state.phase === 'drafting' && iterations-- > 0) {
+    const playerIndex = state.currentPlayerIndex;
+    const weights = playerIndex === candidatePlayerIndex ? candidateWeights : baselineWeights;
+    state = simulateDraft(state, trainingMove(state, playerIndex, weights), playerIndex);
+  }
+  const candidateScore = state.players[candidatePlayerIndex].score;
+  const baselineScore = state.players[1 - candidatePlayerIndex].score;
+  return candidateScore > baselineScore ? 1 : candidateScore < baselineScore ? -1 : 0;
+}
+
+function evaluateCheckpoint(
+  candidateWeights: number[],
+  baselineWeights: number[],
+  initGame: (...args: any[]) => GameState,
+): CheckpointEvaluation {
+  let wins = 0, losses = 0, draws = 0;
+  for (let game = 0; game < CHECKPOINT_EVALUATION_GAMES; game++) {
+    const result = playEvaluationGame(candidateWeights, baselineWeights, game % 2, initGame);
+    if (result > 0) wins++;
+    else if (result < 0) losses++;
+    else draws++;
+  }
+  const score = (wins + draws * 0.5) / CHECKPOINT_EVALUATION_GAMES;
+  return {
+    games: CHECKPOINT_EVALUATION_GAMES, wins, losses, draws, score,
+    accepted: score >= CHECKPOINT_ACCEPTANCE_RATE,
+  };
+}
+
 export function runOneTrainingGame(
   initGame: (...args: any[]) => GameState
 ): { scores: number[]; games: number } {
@@ -1092,19 +1356,7 @@ export function runOneTrainingGame(
 
     traj.push({ f: extractFeatures(cur, pi), pi });
 
-    const scored: ScoredMove[] = moves.map((m) => ({ ...m, score: quickEvalMove(cur, m, pi) }));
-    scored.sort((a, b) => b.score - a.score);
-
-    let chosen: AIMove;
-    if (Math.random() < 0.15) {
-      const row = scored.filter((m) => m.targetRowIndex !== 'floor');
-      const pool = row.length > 0 ? row : scored;
-      chosen = pool[Math.floor(Math.random() * pool.length)];
-    } else {
-      chosen = scored[0];
-    }
-
-    cur = simulateDraft(cur, chosen, pi);
+    cur = simulateDraft(cur, trainingMove(cur, pi, currentWeights, 0.15), pi);
     if (cur.phase !== 'drafting' && cur.phase !== 'game_over') break;
   }
 
@@ -1148,10 +1400,35 @@ export function runOneTrainingGame(
   return { scores: finals, games: trainingCount };
 }
 
-export function runTrainingBatch(n: number, init: (...args: any[]) => GameState): number {
+export function runTrainingBatch(
+  n: number,
+  init: (...args: any[]) => GameState,
+  evaluateAfterBatch = true,
+): number {
+  const baselineWeights = [...currentWeights];
   for (let i = 0; i < n; i++) runOneTrainingGame(init);
+  if (!evaluateAfterBatch) return trainingCount;
+  lastCheckpointEvaluation = evaluateCheckpoint(currentWeights, baselineWeights, init);
+  if (!lastCheckpointEvaluation.accepted) currentWeights = baselineWeights;
   saveWeights();
   return trainingCount;
+}
+
+/** Evaluates all batches since beginTrainingCheckpoint and keeps only winners. */
+export function finishTrainingCheckpoint(init: (...args: any[]) => GameState): CheckpointEvaluation {
+  const baselineWeights = trainingCheckpointBaseline ?? [...currentWeights];
+  trainingCheckpointBaseline = null;
+  lastCheckpointEvaluation = evaluateCheckpoint(currentWeights, baselineWeights, init);
+  if (!lastCheckpointEvaluation.accepted) currentWeights = baselineWeights;
+  saveWeights();
+  return lastCheckpointEvaluation;
+}
+
+/** Cancelling a training run restores its last accepted checkpoint. */
+export function cancelTrainingCheckpoint(): void {
+  if (trainingCheckpointBaseline) currentWeights = trainingCheckpointBaseline;
+  trainingCheckpointBaseline = null;
+  saveWeights();
 }
 
 // ─────────────────────────────────────────────

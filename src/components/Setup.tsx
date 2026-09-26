@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { PlayerType, AIDifficulty } from '../types/game';
 import { cn } from '../utils/cn';
-import { runTrainingBatch, getTrainingInfo, resetWeights, exportWeights, importWeights } from '../utils/aiEngine';
+import { beginTrainingCheckpoint, cancelTrainingCheckpoint, finishTrainingCheckpoint, runTrainingBatch, getTrainingInfo, getLastCheckpointEvaluation, resetWeights, exportWeights, importWeights } from '../utils/aiEngine';
 import { initializeGame } from '../utils/gameEngine';
 
 interface SetupProps {
@@ -59,6 +59,7 @@ export const Setup: React.FC<SetupProps> = ({ onStartGame, onOpenRules }) => {
     setImportStatus('');
     setTrainingProgress(`0 / ${count.toLocaleString()}`);
     trainingStartTime.current = Date.now();
+    beginTrainingCheckpoint();
 
     const batchSize = count >= 10000 ? 100 : count >= 1000 ? 30 : 10;
     const uiInterval = count >= 10000 ? 500 : count >= 1000 ? 100 : batchSize;
@@ -67,19 +68,28 @@ export const Setup: React.FC<SetupProps> = ({ onStartGame, onOpenRules }) => {
 
     const runBatch = () => {
       if (completed >= count || !trainingRef.current) {
+        const finished = completed >= count;
         setIsTraining(false);
         trainingRef.current = false;
+        if (finished) finishTrainingCheckpoint(initializeGame);
+        else cancelTrainingCheckpoint();
         const info = getTrainingInfo();
         setTrainingGames(info.count);
+        const evaluation = getLastCheckpointEvaluation();
         const elapsed = (Date.now() - trainingStartTime.current) / 1000;
         const speed = completed / Math.max(elapsed, 0.001);
-        setTrainingProgress(`✅ ${completed.toLocaleString()}局完了 (${elapsed.toFixed(1)}秒, ${speed.toFixed(0)}g/s)`);
+        const checkpoint = evaluation
+          ? ` / 検証 ${evaluation.wins}勝${evaluation.losses}敗${evaluation.draws}分 (${(evaluation.score * 100).toFixed(0)}%) ${evaluation.accepted ? '採用' : '見送り'}`
+          : '';
+        setTrainingProgress(finished
+          ? `✅ ${completed.toLocaleString()}局完了 (${elapsed.toFixed(1)}秒, ${speed.toFixed(0)}g/s)${checkpoint}`
+          : `⏹ ${completed.toLocaleString()}局で停止（今回の候補は破棄）`);
         setTrainingPercent(100);
         return;
       }
 
       const toRun = Math.min(batchSize, count - completed);
-      const total = runTrainingBatch(toRun, initializeGame);
+      const total = runTrainingBatch(toRun, initializeGame, false);
       completed += toRun;
 
       if (completed - lastUi >= uiInterval || completed >= count) {
@@ -349,7 +359,7 @@ export const Setup: React.FC<SetupProps> = ({ onStartGame, onOpenRules }) => {
           <div className="text-[8px] text-slate-500 space-y-0.5">
             <p><span className="font-bold text-emerald-600">初級:</span> ランダム</p>
             <p><span className="font-bold text-amber-600">中級:</span> 効率配置・色集中・縦列優先・先手価値を考慮した貪欲探索</p>
-            <p><span className="font-bold text-rose-600">最強:</span> 75次元特徴量の学習済み評価関数 + Minimax(深度8)</p>
+            <p><span className="font-bold text-rose-600">最強:</span> 117次元特徴量の学習済み評価関数 + Minimax(深度8)</p>
           </div>
         </div>
 
